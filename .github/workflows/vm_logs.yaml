@@ -1,0 +1,52 @@
+name: VM Logs & Odoo Auth Probe
+
+# 일회용 디버그 워크플로우 — VM 의 mcp-server-multi-oosdk 컨테이너 상태 + Odoo 인증을 한 번에 확인.
+# - docker logs --tail 50      : 컨테이너 부팅 / runtime 로그
+# - docker exec python -c ...  : 현재 ODOO_API_KEY env 로 authenticate_odoo() 실시 호출
+#
+# 보안: API key 값은 절대 출력 안 함. prefix 4글자 + length 만 마스킹 출력.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tail_lines:
+        description: 'docker logs --tail N'
+        required: false
+        default: '50'
+
+env:
+  VM_IP: "REDACTED_VM_IP"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH probe
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ env.VM_IP }}
+          username: deploy
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          command_timeout: 2m
+          script: |
+            echo "=== docker ps (oosdk) ==="
+            docker ps --filter name=mcp-server-multi-oosdk --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+            echo ""
+            echo "=== docker logs --tail ${{ github.event.inputs.tail_lines }} ==="
+            docker logs mcp-server-multi-oosdk --tail ${{ github.event.inputs.tail_lines }} 2>&1 || true
+            echo ""
+            echo "=== ODOO env (masked) + authenticate_odoo() ==="
+            docker exec mcp-server-multi-oosdk python -c "
+            import os
+            for k in ('ODOO_URL','ODOO_DB','ODOO_USERNAME','ODOO_API_KEY'):
+                v = os.getenv(k,'') or ''
+                if k == 'ODOO_API_KEY':
+                    print(f'  {k:<14} len={len(v)} prefix={v[:4]!r}')
+                else:
+                    print(f'  {k:<14} = {v!r}')
+            from mcp_server.services import odoo_service
+            ok = odoo_service.authenticate_odoo()
+            print(f'  authenticate_odoo() -> {ok}')
+            print(f'  status              -> {odoo_service.get_service_status()}')
+            " || echo "  (docker exec 실패)"

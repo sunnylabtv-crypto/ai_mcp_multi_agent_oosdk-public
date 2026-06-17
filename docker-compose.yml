@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  mcp-server-multi-oosdk:
+    build: .
+    container_name: mcp-server-multi-oosdk
+    ports:
+      - "9100:9100"  # MCP Server (Multi-Agent OOSDK)
+      - "9101:9101"  # Log Receiver API (OOSDK)
+    volumes:
+      - ./credentials:/app/credentials:ro
+      - ./.env:/app/.env:ro
+      - multi_chromadb_data:/app/data/multi/chromadb
+      - multi_db_data:/app/data/multi/db
+      - ./logs:/app/logs
+    environment:
+      - MCP_MODE=sse
+      - MCP_PORT=9100
+      - LOG_API_PORT=9101
+      - HOST=0.0.0.0
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - CHROMA_PERSIST_DIR=/app/data/multi/chromadb
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9100/mcp"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  multi_chromadb_data:
+    driver: local
+  multi_db_data:
+    driver: local

@@ -1,0 +1,209 @@
+name: Deploy Multi-Agent OOSDK to GCP VM
+
+# ⚠️ OOSDK 실험 버전 - 기존 multi-agent-mcp 배포와 분리됨
+# - IMAGE: multi-agent-mcp-oosdk (별도 이미지)
+# - container: mcp-server-multi-oosdk
+# - ports: 9100 (MCP), 9101 (Log API), 9601/9602 (Dashboard)
+
+on:
+  # ── 수동 트리거 전용 ──
+  # 의도적으로 push 자동 트리거 사용 안 함:
+  #   - dashboard 코드 1줄 바꿔도 Docker build (5~8분) 가 도는 부담
+  #   - 실험 중 잦은 commit 마다 GAR push 비용
+  #   - 잘못된 commit 이 즉시 production VM 으로 흐르는 위험
+  # → 사용자가 GitHub Actions UI 또는 `gh workflow run` 으로 명시적 호출.
+  workflow_dispatch:
+    inputs:
+      deploy_target:
+        description: '배포 대상 (dashboard-only 가 가장 빠름)'
+        required: true
+        default: 'dashboard-only'
+        type: choice
+        options:
+          - dashboard-only   # ~1분 — dashboard.py / dashboard_en.py / dashboard_modules 변경 시
+          - docker-only      # ~6분 — mcp_server / ontology / Dockerfile 변경 시
+          - all              # ~7분 — 둘 다 변경 시
+
+env:
+  PROJECT_ID: "REDACTED_GCP_PROJECT"
+  GAR_LOCATION: "us-west1"
+  REPOSITORY: "mcp-repo"
+  IMAGE: "multi-agent-mcp-oosdk"
+  VM_IP: "REDACTED_VM_IP"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 1. 구글 클라우드 로그인
+      - name: Google Auth
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      # 2. Docker 로그인 (Artifact Registry)
+      - name: Docker Auth
+        if: ${{ github.event.inputs.deploy_target != 'dashboard-only' }}
+        id: docker-auth
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GAR_LOCATION }}-docker.pkg.dev
+          username: _json_key
+          password: ${{ secrets.GCP_SA_KEY }}
+
+      # 3. Docker Buildx 설정 (캐시 지원)
+      - name: Set up Docker Buildx
+        if: ${{ github.event.inputs.deploy_target != 'dashboard-only' }}
+        uses: docker/setup-buildx-action@v3
+
+      # 4. Multi-Agent 이미지 빌드 & Push (캐시 활용)
+      - name: Build and Push Container
+        if: ${{ github.event.inputs.deploy_target != 'dashboard-only' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 5. Docker 배포 (VM에 SSH)
+      - name: Deploy Docker to VM
+        if: ${{ github.event.inputs.deploy_target != 'dashboard-only' }}
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ env.VM_IP }}
+          username: deploy
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          command_timeout: 20m
+          script: |
+            # Docker 권한 재확인
+            gcloud auth configure-docker ${{ env.GAR_LOCATION }}-docker.pkg.dev --quiet
+
+            # 기존 컨테이너 중지 및 삭제 (OOSDK 전용)
+            docker stop mcp-server-multi-oosdk || true
+            docker rm mcp-server-multi-oosdk || true
+
+            # 새 이미지 가져오기
+            docker pull ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE }}:latest
+
+            # Multi-Agent 서버 실행 (OOSDK 실험 버전)
+            mkdir -p ~/mcp_data/multi_oosdk/db
+            mkdir -p ~/mcp_data/multi_oosdk/chromadb
+            # OOSDK 3-Tier Memory warm tier (ontology.yaml: ./data/memory/warm.db)
+            # Volume mount 안 하면 컨테이너 재시작마다 30일 이력이 wipe → ontology 학습/누적 불가.
+            mkdir -p ~/mcp_data/multi_oosdk/memory
+            docker run -d \
+              --name mcp-server-multi-oosdk \
+              --restart unless-stopped \
+              -p 9100:9100 \
+              -p 9101:9101 \
+              -v /home/deploy/mcp_data/multi_oosdk/db:/app/data/multi/db \
+              -v /home/deploy/mcp_data/multi_oosdk/chromadb:/app/data/multi/chromadb \
+              -v /home/deploy/mcp_data/multi_oosdk/memory:/app/data/memory \
+              -e MCP_MODE="sse" \
+              -e MCP_PORT="9100" \
+              -e LOG_API_PORT="9101" \
+              -e CHROMA_PERSIST_DIR="/app/data/multi/chromadb" \
+              -e OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}" \
+              -e SF_CLIENT_ID="${{ secrets.SF_CLIENT_ID }}" \
+              -e SF_USERNAME="${{ secrets.SF_USERNAME }}" \
+              -e SF_PRIVATE_KEY="${{ secrets.SF_PRIVATE_KEY }}" \
+              -e GMAIL_CREDENTIALS="${{ secrets.GMAIL_CREDENTIALS }}" \
+              -e GMAIL_TOKEN="${{ secrets.GMAIL_TOKEN }}" \
+              -e GMAIL_TOKEN_FINANCE="${{ secrets.GMAIL_TOKEN_FINANCE }}" \
+              -e ODOO_URL="${{ secrets.ODOO_URL }}" \
+              -e ODOO_DB="${{ secrets.ODOO_DB }}" \
+              -e ODOO_USERNAME="${{ secrets.ODOO_USERNAME }}" \
+              -e ODOO_API_KEY="${{ secrets.ODOO_API_KEY }}" \
+              ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE }}:latest
+
+            echo "✅ Docker 배포 완료"
+
+      # 6. 대시보드 배포 (VM에 SSH)
+      - name: Deploy Dashboard to VM
+        if: ${{ github.event.inputs.deploy_target != 'docker-only' }}
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ env.VM_IP }}
+          username: deploy
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          command_timeout: 5m
+          script: |
+            # ── 소스코드 동기화 (idempotent) ──
+            # 이전: sudo rm -rf 후 매번 fresh git clone → 수십 초 + 디스크 churn
+            # 변경: .git 있으면 fetch + reset, 없으면 그때만 clone → 1~3 초
+            echo "=== 소스코드 동기화 ==="
+            REPO_DIR=~/ai_mcp_multi_agent_oosdk
+            REPO_URL=https://${{ secrets.GH_TOKEN }}@github.com/ai_mcp_multi_agent_oosdk/ai_mcp_multi_agent_oosdk.git
+            if [ -d "$REPO_DIR/.git" ]; then
+              echo "  · 기존 repo 갱신 (fetch + reset)"
+              cd "$REPO_DIR"
+              git remote set-url origin "$REPO_URL"
+              git fetch origin main --depth=1 || { echo "WARNING: git fetch 실패"; exit 0; }
+              git reset --hard origin/main
+              git clean -fd
+            else
+              echo "  · 신규 clone"
+              sudo rm -rf "$REPO_DIR" || true
+              git clone --depth=1 "$REPO_URL" "$REPO_DIR" || echo "WARNING: git clone 실패"
+            fi
+
+            # 대시보드 실행 (한글 + 영어, OOSDK 포트)
+            if [ -d "$REPO_DIR" ]; then
+              echo "=== 대시보드 설정 ==="
+              kill $(lsof -t -i:9601) 2>/dev/null || true
+              kill $(lsof -t -i:9602) 2>/dev/null || true
+              cd "$REPO_DIR"
+
+              # ── 의존성 설치 (idempotent) ──
+              # 이전: pip install 매번 실행 → metadata 조회로 30s~2m 소요
+              # 변경: import 시도 → 성공하면 skip, 실패하면 그때만 install.
+              # OOSDK dashboard 가 import 하는 4개:
+              #   streamlit (UI), pandas (DataFrame), requests (api_client), yaml (pyyaml — 호환용)
+              if python3 -c "import streamlit, pandas, requests, yaml" 2>/dev/null; then
+                echo "  · 의존성 이미 설치됨 — pip install skip"
+              else
+                echo "  · 누락 패키지 발견 — pip install 실행"
+                pip install --user --quiet streamlit pandas pyyaml requests
+              fi
+
+              nohup ~/.local/bin/streamlit run dashboard.py --server.port 9601 --server.address 0.0.0.0 > /dev/null 2>&1 &
+              nohup ~/.local/bin/streamlit run dashboard_en.py --server.port 9602 --server.address 0.0.0.0 > /dev/null 2>&1 &
+              echo "✅ Dashboard OOSDK (KR): http://${{ env.VM_IP }}:9601"
+              echo "✅ Dashboard OOSDK (EN): http://${{ env.VM_IP }}:9602"
+            else
+              echo "WARNING: 소스코드 없음 - 대시보드 건너뜀"
+            fi
+
+      # 7. 상태 확인
+      - name: Verify Deployment
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ env.VM_IP }}
+          username: deploy
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          command_timeout: 1m
+          script: |
+            echo "=== 서버 상태 확인 (OOSDK) ==="
+            docker logs mcp-server-multi-oosdk --tail 10 2>&1 || true
+            echo ""
+            echo "=== 엔드포인트 (OOSDK) ==="
+            echo "  MCP: http://${{ env.VM_IP }}:9100/mcp?user_id=admin"
+            echo "  Log API: http://${{ env.VM_IP }}:9101"
+            echo "  Dashboard (KR): http://${{ env.VM_IP }}:9601"
+            echo "  Dashboard (EN): http://${{ env.VM_IP }}:9602"
+            echo ""
+            echo "=== 컨테이너 ==="
+            docker ps --format "table {{.Names}}\t{{.Ports}}\t{{.Status}}"

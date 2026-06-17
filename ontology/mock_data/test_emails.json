@@ -1,0 +1,29 @@
+[
+  {
+    "id": "email_001_vip",
+    "from": "vip.customer@example.com",
+    "from_name": "Kim VIP",
+    "subject": "긴급 — Q2 계약 연장 및 확장 건",
+    "body": "안녕하세요, VIP Tech Kim 입니다.\n\n이번 분기 계약이 곧 만료되어 연장 및 확장 논의를 빠르게 진행하고 싶습니다. 금주 중 미팅 가능 시간 알려주시면 감사하겠습니다.\n\n감사합니다.\nKim",
+    "received_at": "2026-04-22T09:15:00Z",
+    "expected_rule": "existing_vip"
+  },
+  {
+    "id": "email_002_standard",
+    "from": "finance@example.com",
+    "from_name": "Park Standard",
+    "subject": "제품 도입 관련 문의",
+    "body": "안녕하세요, Standard Tech 구매팀입니다.\n\n저희가 최근 도입을 검토 중인데, 가격표와 도입 사례 자료를 받아볼 수 있을까요?\n\n감사합니다.",
+    "received_at": "2026-04-22T10:30:00Z",
+    "expected_rule": "existing_standard"
+  },
+  {
+    "id": "email_003_unknown",
+    "from": "prospect@example.com",
+    "from_name": "Star Lee",
+    "subject": "협업 제안 드립니다",
+    "body": "안녕하세요,\n\n신규 스타트업 Star Lee 라고 합니다. 귀사 솔루션에 관심이 있어 연락드립니다. 간단한 소개 미팅이 가능할까요?\n\n감사합니다.",
+    "received_at": "2026-04-22T11:45:00Z",
+    "expected_rule": "new_prospect"
+  }
+]

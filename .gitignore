@@ -1,0 +1,34 @@
+# secrets & credentials
+.env
+*.env
+!.env.example
+credentials/
+*.key
+*.pem
+token_*.json
+credentials_new.json
+gcp_key
+gcp_key.pub
+# python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+# data & logs
+data/
+mcp_data/
+chromadb_data/
+logs/
+*.log
+*.db
+*.db-journal
+# os / ide / agent
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/

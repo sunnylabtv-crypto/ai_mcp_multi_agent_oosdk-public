@@ -1,0 +1,52 @@
+steps:
+  # Step 1: Docker 이미지 빌드
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'asia-northeast3-docker.pkg.dev/$PROJECT_ID/mcp-repo/multi-agent-mcp-oosdk:$SHORT_SHA'
+      - '-t'
+      - 'asia-northeast3-docker.pkg.dev/$PROJECT_ID/mcp-repo/multi-agent-mcp-oosdk:latest'
+      - '.'
+
+  # Step 2: Artifact Registry에 push
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'asia-northeast3-docker.pkg.dev/$PROJECT_ID/mcp-repo/multi-agent-mcp-oosdk:$SHORT_SHA'
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'asia-northeast3-docker.pkg.dev/$PROJECT_ID/mcp-repo/multi-agent-mcp-oosdk:latest'
+
+  # Step 3: Cloud Run 배포 (Multi-Agent)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'multi-agent-mcp-oosdk'  # 서비스 이름 (single-agent와 별도)
+      - '--image'
+      - 'asia-northeast3-docker.pkg.dev/$PROJECT_ID/mcp-repo/multi-agent-mcp-oosdk:$SHORT_SHA'
+      - '--region'
+      - 'asia-northeast3'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--memory'
+      - '1Gi'
+      - '--timeout'
+      - '300'
+      - '--port'
+      - '9100'
+      - '--set-env-vars'
+      - 'MCP_MODE=sse,HOST=0.0.0.0,MCP_PORT=9100,LOG_API_PORT=9101,CHROMA_PERSIST_DIR=/app/data/multi/chromadb'
+      - '--set-secrets'
+      - 'OPENAI_API_KEY=openai-api-key:latest,SF_CLIENT_ID=sf-client-id:latest,SF_USERNAME=sf-username:latest,SF_PRIVATE_KEY=sf-jwt-key:latest,GMAIL_CREDENTIALS=gmail-credentials:latest,GMAIL_TOKEN=gmail-token:latest'
+
+images:
+  - 'asia-northeast3-docker.pkg.dev/$PROJECT_ID/mcp-repo/multi-agent-mcp-oosdk:$SHORT_SHA'
+  - 'asia-northeast3-docker.pkg.dev/$PROJECT_ID/mcp-repo/multi-agent-mcp-oosdk:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY

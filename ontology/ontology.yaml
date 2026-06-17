@@ -1,0 +1,988 @@
+# ═══════════════════════════════════════════════════════════════
+# OOSDK Ontology — Phase 1 (VIP / Standard / New Prospect 시나리오)
+# ═══════════════════════════════════════════════════════════════
+# - yaml 에는 "스키마" 만 있고 "인스턴스" 는 없음 (수백~수만 고객 대응)
+# - source.type 교체만으로 다른 데이터 소스 (SFDC / ERP / Mock) 전환
+# - rule 은 선언적 — 코드 수정 없이 yaml 만으로 정책 변경 가능
+# ═══════════════════════════════════════════════════════════════
+
+ontology:
+  version: "1.5.0"
+  org_id: "demo_org"
+  updated_at: "2026-05-19"
+  description: "Phase 3.1 — BC3 Inventory Allocation + VIP 선점 정책 + 입고 재할당 (Closed Won → Ship)"
+  notes: |
+    [v1.5.0 변경점 — BC3 inventory allocation 본 작업, 구현 완료 2026-05-19]
+    - 새 entity_types 3종:
+      · sale_order_confirmed — SO state='sale' 직후 (BC2 Closed Won 후속)
+      · stock_received       — 입고 (PO receipt) 이벤트
+      · delivery_ready_check — DO 상태 점검 트리거
+    - 새 rules 6종 (BC3 inventory allocation 매트릭스):
+      · order_split_by_line_type (420)         — storable 포함 SO 시 분기 (mixed/storable-only)
+      · inventory_allocate_vip_preempt (410)   — VIP + 재고부족 → Standard "assigned" 회수 (soft)
+      · delivery_ready_to_ship_vip (405)       — VIP 전 라인 reserved → 출고
+      · stock_received_replenish (400)         — 입고 → VIP backorder 우선 + Standard 보충
+      · inventory_allocate_standard (390)      — Standard FIFO + 부족 시 Waiting
+      · service_line_fulfillment (360)         — service-only SO 처리 (storable 없음)
+    - first_match 정합성: order_split 은 has_storable_lines=true 가드, service rule 은 그 외 service-only SO 처리 (mutual exclusive).
+    - 새 agent: inventory_agent (Odoo stock.picking/move/quant 전담, soft preempt mode)
+    - VIP 선점 정책 = soft (옵션 1 채택): state='assigned' 인 Standard move 만 회수, picking 중/완료는 불가침.
+    - "ERP가 fulfillment 를 다 하긴 함. 그 위에 ontology가 policy layer 로 얹힌다." 패턴 시연.
+
+    [v1.4.0 변경점 — A.5.3 idea&Setup 후속]
+    - SFDC Lead → Opp 변환 흐름 명시화 (Lead.Customer_Tier__c → RecordType 매핑).
+      · crm_agent.convert_lead_to_opportunity 신규 액션
+    - VIP 견적은 가격 협상 (markup/discount) 가능, Standard 는 list_price 고정 — 정책 분리.
+      · pricing 블록을 sales_inquiry_vip / sales_inquiry_standard 룰의 policy 에 명시
+    - 견적 회신 메일 2종 분리 (VIP premium 톤 / Standard 표준 톤).
+      · email_agent.send_quote_response 신규 액션
+    - storable product 지원 — ERP product_type 옵션화 (BC3 inventory 분기 준비).
+      · erp_agent.create_sales_order policy 에 product_type/product_name 추가
+
+    [v1.3.0 변경점 — BC2 영업 사이클]
+    - 신규 entity_type 2종 추가:
+      · sales_opportunity_inquiry — 견적 문의 인입 시 Opp 생성 분기 (VIP 5-stage / Standard 4-stage)
+      · sales_opportunity_close   — Opp Closed Won/Lost 시 후속 멀티 에이전트 dispatch
+    - 신규 룰 5개 (sales_*) — tier (VIP/Standard) 와 stage (Won/Lost) 조합으로 4 갈래 분기 + Win 비-VIP 패턴.
+    - 신규 agent 2종 추가: erp_agent (Odoo SO 생성), analytics_agent (Lost 사유 분석).
+    - 기존 crm_agent 에 신규 action 2종 (create_sales_opportunity, create_reengage_task) 추가.
+    - 모든 분기는 yaml 한 장으로 표현 — 영업 정책 변경 = yaml 한 줄 수정 (코드 재배포 X).
+
+    [v1.2.0 변경점]
+    - rules.then.events (구식 단일 tool 매핑) → rules.then.delegate_to (agent + action + policy) 로 이전.
+    - delegate_to 항목 형식: { agent: <agent_id>, action: <action_name>, policy: {...} }
+      · agent: 도메인 전문 Agent (mcp_server/agents/*)
+      · action: 해당 Agent.execute_action() 으로 호출되는 정책 기반 핸들러
+      · policy: action 핸들러에 전달할 파라미터 (도메인 정책)
+    - 의도: "Ontology = WHAT (어떤 정책을 어디에 위임), Agent = HOW (도메인 처리)"
+    - events: 섹션은 backward-compat 로 유지 (engine 이 둘 다 인식). 신규 정책은 delegate_to 만 사용.
+
+
+# ═══════════════════════════════════════════════════════════════
+# 1. Connections — 외부 시스템 연결 (credential 중복 제거)
+# ═══════════════════════════════════════════════════════════════
+connections:
+  sfdc_primary:
+    provider: salesforce
+    credentials_ref: SFDC_CREDENTIALS      # 환경변수/시크릿 참조 (yaml 에 credential 박지 않음)
+    api_version: "v60.0"
+    circuit_breaker:
+      failure_threshold: 5
+      recovery_timeout: 60
+
+
+# ═══════════════════════════════════════════════════════════════
+# 2. Object Types — 도메인 엔터티 (스키마만, 인스턴스 없음)
+# ═══════════════════════════════════════════════════════════════
+object_types:
+
+  # ─── Person: 이메일 발신자 ───
+  Person:
+    fields:
+      - { name: email,         type: string, required: true }
+      - { name: name,          type: string }
+      - { name: email_domain,  type: string, indexed: true }
+    source:
+      type: inline               # payload 에서 직접 파싱 (외부 조회 없음)
+
+  # ─── Customer: 등록된 고객 (SFDC Lead — 이메일 단위 식별) ───
+  Customer:
+    fields:
+      - { name: id,              type: string, required: true }
+      - { name: name,            type: string }
+      - { name: email,           type: string, indexed: true }
+      - { name: company,         type: string }
+      - { name: tier,            type: string }              # "VIP" | "Standard" | "Bronze"
+      - { name: annual_revenue,  type: number }
+      - { name: owner_id,        type: string }
+    source:
+      # ─── Phase 2: SFDC Lead 단위 조회 (gmail.com 등 공용 도메인 대응) ───
+      type: salesforce
+      connection: sfdc_primary
+      object: Lead
+      lookup:
+        by: email
+        query: |
+          SELECT Id, Name, Email, Company, Customer_Tier__c, AnnualRevenue, OwnerId
+          FROM Lead
+          WHERE Email = '{email}'
+          LIMIT 1
+      field_map:
+        id: Id
+        name: Name
+        email: Email
+        company: Company
+        tier: Customer_Tier__c
+        annual_revenue: AnnualRevenue
+        owner_id: OwnerId
+      # ─── Fallback (SFDC 장애 시 / 로컬 개발) ───
+      fallback:
+        type: local_json
+        path: "./ontology/mock_data/mock_customers.json"
+        lookup:
+          by: email
+    cache:
+      ttl_sec: 3600
+      max_entries: 10000
+      strategy: LRU
+
+  # ─── Lead: 영업 리드 (Person + Customer 로부터 생성) ───
+  Lead:
+    fields:
+      - { name: id,            type: string }
+      - { name: person_id,     type: string, required: true }
+      - { name: customer_id,   type: string }                # null = new prospect
+      - { name: status,        type: string }                # "new" | "qualified" | "unqualified" | "Closed - Converted"
+      - { name: priority,      type: string }                # "high" | "normal" | "unknown"
+      # ─── BC2: 견적 문의 시 Lead.Customer_Tier__c → Opp.RecordType 매핑 ───
+      - { name: customer_tier, type: string }                # "VIP" | "Standard" — SFDC Lead.Customer_Tier__c
+      - { name: company,       type: string }                # 변환 시 Account 후보
+      - { name: email,         type: string }
+    source:
+      type: salesforce
+      connection: sfdc_primary
+      object: Lead
+      lookup:
+        by: id
+        query: |
+          SELECT Id, Name, Email, Company, Status, Customer_Tier__c
+          FROM Lead
+          WHERE Id = '{id}' LIMIT 1
+      field_map:
+        id: Id
+        email: Email
+        company: Company
+        status: Status
+        customer_tier: Customer_Tier__c
+
+  # ─── Account: SFDC Account (BC2 — 견적 문의 시 tier 식별) ───
+  Account:
+    fields:
+      - { name: id,                type: string, required: true }
+      - { name: name,              type: string, indexed: true }
+      - { name: customer_priority, type: string }            # "VIP" | "Standard"
+      - { name: annual_revenue,    type: number }
+    source:
+      type: salesforce
+      connection: sfdc_primary
+      object: Account
+      lookup:
+        by: name
+        query: |
+          SELECT Id, Name, CustomerPriority__c, AnnualRevenue, OwnerId
+          FROM Account
+          WHERE Name = '{name}'
+          LIMIT 1
+      field_map:
+        id: Id
+        name: Name
+        customer_priority: CustomerPriority__c
+        annual_revenue: AnnualRevenue
+    cache:
+      ttl_sec: 3600
+      max_entries: 1000
+      strategy: LRU
+
+  # ─── Opportunity: SFDC Opportunity (BC2 — Win/Lost 분기 결정 인자) ───
+  # Opp 인스턴스는 payload 로 직접 전달되므로 inline 처리 (별도 SOQL 조회 없음).
+  Opportunity:
+    fields:
+      - { name: id,                  type: string }
+      - { name: name,                type: string }
+      - { name: stage,               type: string }          # "Qualification" | "Analysis" | "Quote" | "Closed Won" | "Closed Lost"
+      - { name: tier,                type: string }          # "VIP" | "Standard" — Account 로부터 상속
+      - { name: amount,              type: number }
+      - { name: account_name,        type: string }
+      - { name: record_type_dev_name,type: string }          # "Opp_VIP" | "Opp_Standard"
+      - { name: lost_reason,         type: string }          # Closed Lost 시
+    source:
+      type: inline                   # payload 에서 직접 전달 (resolve_links 가 그대로 통과)
+
+  # ─── BC3 — SalesOrder: Odoo sale.order (Closed Won 후속의 inventory 분기 진입점) ───
+  SalesOrder:
+    fields:
+      - { name: id,                type: number }            # Odoo sale.order.id
+      - { name: name,              type: string }            # "S00042"
+      - { name: state,             type: string }            # "draft" | "sale" | "done" | "cancel"
+      - { name: client_order_ref,  type: string }            # = SFDC Opp.Name (멱등성 키)
+      - { name: tier,              type: string }            # 상속 — Account/Customer 로부터
+      - { name: account_name,      type: string }
+      - { name: amount_total,      type: number }
+      - { name: target_delivery_date, type: string }         # ISO date — 고객 요청 납기
+      - { name: has_storable_lines, type: boolean }          # 라인 중 storable 1개 이상
+      - { name: has_service_lines,  type: boolean }          # 라인 중 service/consu 1개 이상
+    source:
+      type: inline                   # payload 직접 전달 — Odoo lookup 은 odoo_service 에서
+
+  # ─── BC3 — StockPicking: Odoo stock.picking (= Delivery Order) ───
+  # SO confirmed 시 storable 라인마다 자동 생성됨. allocation 의 1차 대상.
+  StockPicking:
+    fields:
+      - { name: id,                type: number }            # Odoo stock.picking.id
+      - { name: name,              type: string }            # "WH/OUT/00042"
+      - { name: state,             type: string }            # "draft"|"waiting"|"confirmed"|"assigned"|"done"|"cancel"
+      - { name: scheduled_date,    type: string }            # ISO datetime
+      - { name: sale_order_id,     type: number }            # FK → sale.order
+      - { name: tier,              type: string }            # SO 로부터 상속
+      - { name: priority_score,    type: number }            # 정책 계산 결과: VIP=100, Standard=50, base+tier+date
+    source:
+      type: inline
+
+  # ─── BC3 — InventoryState: 가용재고 / 할당가능 / 입고예정 (derived from stock.quant + PO) ───
+  # Odoo 의 raw stock.quant 를 ontology 정책이 다루기 좋은 형태로 압축.
+  InventoryState:
+    fields:
+      - { name: product_id,        type: number }            # Odoo product.product.id
+      - { name: product_name,      type: string }
+      - { name: on_hand,           type: number }            # 물리적 보유 (sum quants.quantity)
+      - { name: reserved,          type: number }            # 이미 다른 DO에 할당 (sum quants.reserved_quantity)
+      - { name: available,         type: number }            # on_hand - reserved
+      - { name: incoming,          type: number }            # PO 입고 예정 (target_delivery 까지)
+      - { name: projected_avail,   type: number }            # available + incoming (target_delivery 기준)
+    source:
+      type: inline                   # 계산 결과 — odoo_service.get_product_quants + PO 합산
+
+  # ─── BC3 — StockReceipt: 입고 이벤트 (PO 도착 / 수동 등록) ───
+  # stock_received entity 의 payload 가 매핑됨.
+  StockReceipt:
+    fields:
+      - { name: product_id,        type: number }
+      - { name: product_name,      type: string }
+      - { name: qty,               type: number }            # 입고 수량
+      - { name: received_at,       type: string }            # ISO datetime
+      - { name: source_po_id,      type: number }            # 옵션 — PO 추적용
+    source:
+      type: inline
+
+
+# ═══════════════════════════════════════════════════════════════
+# 3. Links — 엔터티 간 관계 (join 규칙)
+# ═══════════════════════════════════════════════════════════════
+links:
+  person_belongs_to_customer:
+    from: Person
+    to: Customer
+    type: belongs_to
+    cardinality: many_to_one
+    join: "person.email_domain == customer.email_domain"
+
+  person_generates_lead:
+    from: Person
+    to: Lead
+    type: generates
+    cardinality: one_to_many
+
+
+# ═══════════════════════════════════════════════════════════════
+# 4. Rules — 선언적 정책 (VIP / Standard / New Prospect 분기)
+# ═══════════════════════════════════════════════════════════════
+# - evaluation: first_match — priority 높은 것부터 평가, 첫 매칭 반환
+# - yaml 수정 = 정책 변경 (코드 재배포 불필요)
+rules:
+  _meta:
+    evaluation: first_match
+    on_no_match: log_and_skip
+
+  # ═══════════════════════════════════════════════════════════════
+  # BC3 — Inventory Allocation (Closed Won → SO Confirmed → Delivery)
+  # ═══════════════════════════════════════════════════════════════
+  # 회사 정책 (yaml = policy as code):
+  #   · SO 가 confirmed 되면 storable 라인 / service 라인을 분기.
+  #   · storable 라인의 allocation 우선순위: VIP > Standard (선점 가능).
+  #   · 재고 부족 시 VIP 는 incoming PO 에 reserve, Standard 는 Waiting.
+  #   · 입고 (stock_received) 이벤트 → VIP backorder 먼저 채움 → 남는 양 Standard 보충.
+  #   · "Odoo 가 transaction (재고 차감, picking validate) 을 하긴 한다.
+  #      그 위에 ontology 정책 (VIP 선점, target_delivery 매칭) 이 얹힌다."
+  #
+  # priority 매트릭스 (BC3):
+  #   420  order_split_by_line_type        — 분기 시작
+  #   410  inventory_allocate_vip_preempt  — VIP + 재고부족 → 선점
+  #   405  delivery_ready_to_ship_vip      — VIP + assigned → 출고 (Standard FIFO 보다 위)
+  #   400  stock_received_replenish        — 입고 → VIP backorder 우선
+  #   390  inventory_allocate_standard     — Standard FIFO (명시적 tier != VIP 필터)
+  #   385  inventory_replenish_on_shortage — BC5: 충족 불가 → 자율 보충 발주 + 담당자 브리핑 (별도 entity)
+  #   360  service_line_fulfillment        — service 라인 (재고 무관)
+
+  # ─── SO Confirmed → 라인 type 별 분기 (service vs storable) ───
+  # ⚠️ first_match 정책 — 이 룰은 storable 라인이 있을 때만 발화.
+  #    service-only SO 는 service_line_fulfillment (360) 가 처리.
+  #    mixed SO (service + storable) 는 이 룰이 둘 다 분기 처리 (split_fulfillment_path 액션).
+  order_split_by_line_type:
+    priority: 420
+    description: "SO confirmed 시 line type 별로 fulfillment 경로 분기 (storable→DO allocation, service→activation)"
+    if: "entity == 'sale_order_confirmed' AND sales_order != null AND sales_order.state == 'sale' AND sales_order.has_storable_lines == true"
+    then:
+      priority: high
+      memory_tier: warm
+      delegate_to:
+        - agent: inventory_agent
+          action: split_fulfillment_path
+          policy:
+            # service / consulting 라인 → 즉시 fulfillment (재고 무관)
+            service_path:
+              activation: license_auto
+              consulting_kickoff_for_tier: ["VIP"]   # VIP 만 calendar kickoff
+            # storable 라인 → DO allocation 분기 (다음 룰이 이어받음)
+            storable_path:
+              spawn_event: delivery_ready_check     # 다음 룰 트리거
+              tier_priority_score:
+                VIP: 100
+                Standard: 50
+                Bronze: 25
+              target_delivery_match: true           # target_delivery_date 까지 incoming 도 고려
+        - agent: crm_agent
+          action: log_interaction
+          policy:
+            activity_type: so_confirmed_split
+
+  # ─── VIP DO + 재고부족 → Standard 의 미출고 reservation 선점 ───
+  # NOTE (BC3 CRIT #2 봉합): picking.state != 'assigned' 가드로 405 와 분리.
+  #   410 = "VIP 가 아직 reserve 안 됨 (confirmed/waiting/partially_available) + shortage"
+  #   405 = "VIP 가 이미 reserve 완료 (assigned)" → 출고 단계
+  # 이전엔 inventory payload 누락 hack 으로 405 유도했지만, 이제 yaml 만으로 mutex.
+
+  # ─── 사전 배치 (Pre-allocation Batched Priority) — BC3-v3 ───
+  # 전제: stock.picking.type.reservation_method = 'manual'
+  #       (SO confirm 시 picking 만 만들고 reserve 보류)
+  # 진입: 사용자/cron 이 cut-off 시점 (예: 매일 13:00) 에 명시적으로 발화.
+  # 우선순위 415 — 410 (소급 재할당) 보다 먼저. 사전 배치가 성공하면 사후 회수
+  # 시나리오 자체가 안 생긴다.
+  inventory_batch_allocation_window:
+    priority: 415
+    description: "cut-off 시점 — confirmed/waiting picking 들을 tier 우선순위로 일괄 reserve"
+    if: "entity == 'inventory_allocation_window_cutoff'"
+    then:
+      priority: high
+      memory_tier: warm
+      delegate_to:
+        - agent: inventory_agent
+          action: allocate_batched_by_tier
+          policy:
+            ordering: [tier, scheduled_date, sale_order_id]
+            tier_priority:
+              VIP: 100
+              Standard: 50
+              Bronze: 25
+            consume_all_for_vip_first: true
+            unblock_waiting_pickings: true
+            # ── BC4 S0: Priority Override (Case A) — replenish 와 동일 정책 ──
+            priority_override:
+              enabled: true
+              mode: equal_vip
+              boost_score: 1000
+              requires_authorization: true
+              max_per_day: 3
+              auto_expire_hours: 24
+              audit_retention_days: 90
+        - agent: crm_agent
+          action: log_interaction
+          policy:
+            activity_type: inventory_batch_allocation
+
+  inventory_allocate_vip_preempt:
+    priority: 410
+    description: "VIP DO 가 재고 부족 시 — Standard 의 not-yet-picked reservation 을 unreserve 후 VIP 가 차지"
+    # BC4 S1: inventory.available != null 가드 추가 — available 미제공 시 None 비교
+    # TypeError 가 조용히 False 로 삼켜지던 것을 명시화. available 모르면 405 advisor 로.
+    if: "entity == 'delivery_ready_check' AND picking != null AND picking.tier == 'VIP' AND picking.state != 'assigned' AND inventory != null AND inventory.available != null AND inventory.available < picking.qty_demand"
+    then:
+      priority: high
+      memory_tier: warm
+      delegate_to:
+        - agent: inventory_agent
+          action: allocate_with_preemption
+          policy:
+            tier: VIP
+            preempt_mode: soft                      # soft = picking 시작 안 한 Standard 만 회수
+                                                     # hard = picking 중도 회수 (현장 혼란 가능, 보류)
+            preempt_target_states: ["assigned"]     # Odoo state 가 'assigned' 면 회수 가능
+            preempt_exclude_states: ["partially_available", "done"]
+            backorder_against_incoming: true        # 재고 부족분은 incoming PO 에 reserve
+            notify_account_owner: true              # Standard 가 Waiting 으로 밀리면 알림
+        - agent: email_agent
+          action: send_allocation_notice
+          policy:
+            tier: VIP
+            tone: premium
+            include_eta: true
+            sla_hours: 4
+        - agent: crm_agent
+          action: log_interaction
+          policy:
+            activity_type: inventory_vip_preempt
+
+  # ─── 입고 (stock_received) → VIP backorder 우선 채움 + Standard 보충 ───
+  stock_received_replenish:
+    priority: 400
+    description: "입고 이벤트 → VIP backorder 큐 우선 (FIFO+date) → 남은 양으로 Standard Waiting 보충"
+    if: "entity == 'stock_received' AND receipt != null AND receipt.qty > 0"
+    then:
+      priority: high
+      memory_tier: warm
+      delegate_to:
+        - agent: inventory_agent
+          action: replenish_priority_queue
+          policy:
+            ordering: [tier, target_delivery_date, sale_order_id]   # 우선순위 sort key
+            tier_priority:
+              VIP: 100
+              Standard: 50
+              Bronze: 25
+            consume_all_for_vip_first: true         # VIP 미충족 분 다 채울 때까지 Standard 안 줌
+            unblock_waiting_pickings: true          # state='waiting' DO 를 'assigned' 로 전환
+            # ── BC4 S0: Priority Override (Case A — 명시적 지정형) ──
+            # 사람이 trigger 에 priority_override_so_ids 를 넘기면 해당 SO 의
+            # 정렬 _score 를 boost. LLM 미개입, 결정론 유지. 남용 가드 필수.
+            priority_override:
+              enabled: true
+              mode: equal_vip          # equal_vip = VIP 동급(약속 안 깸) | above_vip = VIP 위로
+              boost_score: 1000         # above_vip 모드일 때만 사용 (VIP 점수에 가산)
+              requires_authorization: true   # requested_by 없으면 override 거부
+              max_per_day: 3            # 하루 override 발행 상한
+              auto_expire_hours: 24     # 발행 후 N시간 지나면 무효 ("오늘만"의 영구화 방지)
+              audit_retention_days: 90  # override_audit 보관 기간
+        - agent: email_agent
+          action: send_allocation_notice
+          policy:
+            tone: professional
+            template: stock_replenished
+            audience: affected_owners               # VIP backorder 해소 + Standard Waiting 해소된 owner 들
+        - agent: crm_agent
+          action: log_interaction
+          policy:
+            activity_type: stock_received_replenish
+
+  # ─── BC5: 충족 불가 → 자율 보충 발주 + 담당자 브리핑 ───
+  # 규칙으로 못 푸는 예외 — VIP 주문인데 재고 0, 선점할 Standard reservation 도 없어
+  # 어떤 결정론 규칙으로도 채울 수 없는 상황. agent 가 감지→판단(LLM)→발주→브리핑.
+  # 진입: 사용자/cron 이 trigger_replenishment_check 로 명시 발화 (entity 주입).
+  #       server 가 get_open_demand_for_product 결과를 context.shortage 로 넣어준다.
+  # purchase 모듈 없음 → 발주는 incoming stock.picking 직접 생성 (odoo_service).
+  inventory_replenish_on_shortage:
+    priority: 385
+    description: "재고 점검 요청 → inventory_agent 가 부족분 감지·발주량 판단·발주, email 이 담당자 브리핑"
+    # 안 C: 게이트는 순수 이벤트만(전략). "부족분이 있는가"의 도메인 판정은 inventory_agent
+    # 가 소유(unmet<=0 이면 agent 가 no-op skip). ontology 가 도메인 파생값(unmet_qty)에
+    # 의존하지 않게 함 — 다른 rule(400 의 receipt.qty>0 등)과 동일한 "얇은 게이트" 일관성.
+    if: "entity == 'inventory_shortage_detected'"
+    then:
+      priority: high
+      memory_tier: warm
+      delegate_to:
+        - agent: inventory_agent
+          action: create_replenishment_po
+          policy:
+            auto_create_po: true            # 사용자 결정: 발주 자동 실행 (incoming picking 생성)
+            vendor_name: "TechSupply Co"     # 기본 공급처 (없으면 자동 생성)
+            safety_buffer_units: 0           # rule 폴백 시 부족분에 더할 안전버퍼
+            lead_time_days: 3                # advisor 판단 입력
+            dry_run: false                   # true 면 발주 보류(추천만) — 라이브 시연 안전토글
+            # ── 판단 ① — 발주량/긴급도는 inventory_agent._replenishment_qty_advisor(LLM).
+            #    LLM 실패 시 rule 폴백(unmet + safety_buffer). 절대 멈추지 않음.
+        - agent: email_agent
+          action: send_replenishment_alert
+          policy:
+            tone: professional
+            language: ko
+            auto_send: true                  # 사용자 결정: 담당자 메일 자동 전송
+            notify_role: ops_manager         # 정책 = "운영 담당자에게 통보". 실제 주소는
+                                             # 데이터/config(trigger 인자 또는 env)에서 resolve.
+                                             # ontology 에는 전략만, 주소(데이터)는 안 박는다.
+            # ── 판단 ② — 브리핑 본문은 LLM 작성. 실패 시 결정론 템플릿 폴백.
+        - agent: crm_agent
+          action: log_interaction
+          policy:
+            activity_type: inventory_replenish_on_shortage
+
+  # ─── Standard DO → FIFO 할당 (남는 가용재고만) ───
+  inventory_allocate_standard:
+    priority: 390
+    description: "Standard DO — 가용재고 범위에서 FIFO. 부족하면 Waiting 큐로."
+    # picking.tier != 'VIP' 명시 — VIP 의 preempt/ship rule 우선 매칭 보장
+    if: "entity == 'delivery_ready_check' AND picking != null AND picking.tier != 'VIP'"
+    then:
+      priority: normal
+      memory_tier: warm
+      delegate_to:
+        - agent: inventory_agent
+          action: allocate_fifo
+          policy:
+            tier: Standard
+            wait_for_incoming: true                 # 재고 0 이면 Waiting 큐 진입
+            wait_alert_after_days: 7                # 7일 이상 Waiting 시 owner 에게 알림 (BC4)
+        - agent: crm_agent
+          action: log_interaction
+          policy:
+            activity_type: inventory_standard_fifo
+
+  # ─── 전 라인 reserved + VIP → 출고 dispatch (Odoo picking validate) ───
+  delivery_ready_to_ship_vip:
+    priority: 405
+    description: "VIP DO 의 라인 reserved → stock.picking validate → 출고(전량) 또는 부분출하 판단 + VIP 톤 알림"
+    # BC4 S1: partially_available(부분 reserve)도 dispatch 로 보냄 → wizard 분기로 부분출하 판단.
+    # 410 preempt 와의 관계: 410 은 inventory.available 가 채워지고(< qty_demand) 일 때만
+    # 우선한다(priority 410 > 405). inventory.available 가 없는 발화 경로
+    # (예: trigger_delivery_dispatch)에서는 410 이 매칭 안 돼 partial 이 405 advisor 로 간다 —
+    # 이는 "이 picking 을 출하하라"는 명시 트리거의 의도된 동작.
+    if: "entity == 'delivery_ready_check' AND picking != null AND picking.tier == 'VIP' AND (picking.state == 'assigned' OR picking.state == 'partially_available')"
+    then:
+      priority: high
+      memory_tier: warm
+      delegate_to:
+        - agent: inventory_agent
+          action: dispatch_shipment
+          policy:
+            target_state: done                      # Odoo picking.state = 'done'
+            confirm_immediately: true
+            carrier_lookup: by_tier                 # VIP 우선 carrier (BC4 확장 포인트)
+            # ── BC4 S1: Partial Shipment Handling ──
+            # auto_backorder    = 가용분 출하 + 나머지 backorder (무해·기본 권장)
+            # cancel_remainder  = 가용분 출하 + 나머지 취소 (파괴적)
+            # llm_advisor       = LLM split/wait 추천 (추천만, 사람 승인 후 실행)
+            partial_handling: llm_advisor
+            rule_baseline: split                    # llm_advisor 폴백 / API 실패 시 추천
+            auto_execute_advisor: false             # 기본 false — 사람 승인 필수 (안전)
+        - agent: email_agent
+          action: send_shipping_notification
+          policy:
+            tier: VIP
+            tone: premium
+            include_tracking: true
+            sla_hours: 2
+        - agent: calendar_agent
+          action: update_delivery_milestone
+          policy:
+            tier: VIP
+            milestone: shipped
+        - agent: crm_agent
+          action: log_interaction
+          policy:
+            activity_type: delivery_shipped_vip
+
+  # ─── service / consulting 라인 (재고 무관) — 즉시 활성화 + VIP kickoff ───
+  service_line_fulfillment:
+    priority: 360
+    description: "service/consulting 라인 — 라이선스 자동 활성화. VIP 는 consulting kickoff 추가."
+    if: "entity == 'sale_order_confirmed' AND sales_order != null AND sales_order.has_service_lines == true"
+    then:
+      priority: normal
+      memory_tier: warm
+      delegate_to:
+        - agent: email_agent
+          action: send_license_activation
+          policy:
+            tone: professional
+            template: license_ready
+            sla_hours: 2
+        - agent: crm_agent
+          action: log_interaction
+          policy:
+            activity_type: service_fulfillment
+
+  # ═══════════════════════════════════════════════════════════════
+  # BC2 — Sales Opportunity Inquiry (견적 문의 인입 → Opp 생성)
+  # ═══════════════════════════════════════════════════════════════
+  # 회사 정책 (yaml = policy as code):
+  #   · VIP 고객 → 5-stage 프로세스 (Qualification → Analysis ★ → Quote → Win/Lost)
+  #     ★ Analysis = 가격 협상 권한 단계 (VIP 전용)
+  #   · Standard 고객 → 4-stage 프로세스 (Qualification → Quote → Win/Lost)
+  #     (Analysis 없음, 표준 단가표 적용)
+  #   · 차이는 SFDC Record Type 으로 구현 (Opp_VIP vs Opp_Standard)
+  #   · 매칭 = sales_opportunity_inquiry entity + customer.tier 로 분기
+  # ─── VIP 견적 문의 → 5-stage VIP_Sales_Process Opp 생성 + 가격 협상 권한 ───
+  # create_sales_opportunity 액션이 context.lead 가 있으면 Lead Convert 후 Opp 생성,
+  # 없으면 Account 직접 Opp 생성 — 한 액션으로 두 시나리오를 처리.
+  sales_inquiry_vip:
+    priority: 220
+    description: "VIP 고객의 견적 문의 — Opp_VIP RecordType + 5-stage + 가격 협상 (discount/markup 권한)"
+    if: "entity == 'sales_opportunity_inquiry' AND customer != null AND customer.tier == 'VIP'"
+    then:
+      priority: high
+      memory_tier: hot
+      delegate_to:
+        # CRM: Lead 변환 (있을 시) + Opp 생성 — 한 액션이 자동 분기
+        - agent: crm_agent
+          action: create_sales_opportunity
+          policy:
+            tier: VIP
+            record_type_dev_name: Opp_VIP
+            initial_stage: Qualification
+            sales_process: VIP_Sales_Process
+            stages: [Qualification, Analysis, Quote, "Closed Won", "Closed Lost"]
+            require_analysis: true
+            close_date_days: 60
+            # context.lead 가 주어지면 SFDC Lead 를 Closed-Converted 로 마감하고
+            # Lead.Customer_Tier__c 를 RecordType 매핑에 우선 사용
+            convert_lead_if_present: true
+            lead_status_on_convert: "Closed - Converted"
+            # ─── VIP 전용 가격 협상 정책 (회사 정책) ───
+            pricing:
+              mode: negotiable                  # 협상 가능 (Analysis stage 에서 권한 부여)
+              max_discount_pct: 25              # 최대 25% 할인까지 영업이 단독 결정
+              markup_pct: 0                     # 표준 단가 기준에서 할인만
+              approval_required_above_pct: 25   # 25% 초과는 매니저 승인 (BC4 룰)
+              currency: USD
+              quote_validity_days: 30
+        # 견적 회신 메일 — VIP 톤 (premium, 협상 여지 명시)
+        - agent: email_agent
+          action: send_quote_response
+          policy:
+            tier: VIP
+            tone: premium
+            language: ko
+            template: quote_vip
+            include_discount_offer: true       # "협상 가능" 명시
+            sla_hours: 4
+        - agent: crm_agent
+          action: log_interaction
+          policy:
+            activity_type: sales_inquiry_vip
+
+  # ─── Standard 견적 문의 → 4-stage + 표준 단가 (할인 X) ───
+  sales_inquiry_standard:
+    priority: 200
+    description: "Standard 고객의 견적 문의 — Opp_Standard RecordType + 4-stage + 표준 단가 (할인 권한 없음)"
+    if: "entity == 'sales_opportunity_inquiry' AND customer != null"
+    then:
+      priority: normal
+      memory_tier: hot
+      delegate_to:
+        - agent: crm_agent
+          action: create_sales_opportunity
+          policy:
+            tier: Standard
+            record_type_dev_name: Opp_Standard
+            initial_stage: Qualification
+            sales_process: Standard_Sales_Process
+            stages: [Qualification, Quote, "Closed Won", "Closed Lost"]
+            require_analysis: false
+            close_date_days: 30
+            convert_lead_if_present: true
+            lead_status_on_convert: "Closed - Converted"
+            # ─── Standard 전용 정가 정책 ───
+            pricing:
+              mode: list_price                  # 정가 고정 (협상 불가)
+              max_discount_pct: 0               # 영업 단독 할인 권한 없음
+              markup_pct: 0
+              approval_required_above_pct: 0    # 모든 할인은 매니저 승인
+              currency: USD
+              quote_validity_days: 14
+        # 견적 회신 메일 — Standard 톤 (정가, 명료, 짧게)
+        - agent: email_agent
+          action: send_quote_response
+          policy:
+            tier: Standard
+            tone: professional
+            language: ko
+            template: quote_standard
+            include_discount_offer: false      # 정가 only
+            sla_hours: 24
+        - agent: crm_agent
+          action: log_interaction
+          policy:
+            activity_type: sales_inquiry_standard
+
+  # ═══════════════════════════════════════════════════════════════
+  # BC2 — Sales Opportunity Close (Win/Lost 멀티 에이전트 분기)
+  # ═══════════════════════════════════════════════════════════════
+  # "한 번의 stage 변경 (Closed Won 클릭) 이 최대 4 에이전트를 동시 호출.
+  #  영업 정책 yaml 이 모든 분기를 결정. 코드 한 줄 안 건드리고 정책 변경." (BC2 narrative)
+  #
+  # 분기 매트릭스:
+  #   Closed Won  + VIP      → ERP + Email + Calendar + CRM(log)        [4 agents]
+  #   Closed Won  + Standard → ERP + Email + CRM(log)                   [3 agents]
+  #   Closed Lost (any tier) → Analytics + CRM(reengage) + CRM(log)     [3 agents]
+  # ─── VIP Win → 4 에이전트 동시 발화 (Survey/Email/ERP/Calendar) ───
+  opp_won_vip:
+    priority: 320
+    description: "VIP Opp Closed Won — ERP SO + 감사 메일 + Kickoff 미팅 + 활동 로그 (4 에이전트 동시 발화)"
+    if: "entity == 'sales_opportunity_close' AND opportunity != null AND opportunity.stage == 'Closed Won' AND opportunity.tier == 'VIP'"
+    then:
+      priority: high
+      memory_tier: warm
+      delegate_to:
+        - agent: erp_agent
+          action: create_sales_order
+          policy:
+            target_state: sale
+            customer_lookup: by_name
+            tier: VIP
+            confirm_immediately: true
+            # BC3 inventory 분기 준비 — payload 에서 product_type 받으면
+            # storable 도 SO 라인으로 들어감 (재고 추적 시작점).
+            # 미지정 시 product 정보를 payload.products[] 또는 default 로 결정.
+            default_product_type: service       # BC2 시연용
+            product_type_override_from_payload: true
+        - agent: email_agent
+          action: send_thank_you
+          policy:
+            tone: premium
+            language: ko
+            template: vip_thank_you
+            sla_hours: 4
+        - agent: calendar_agent
+          action: book_kickoff_meeting
+          policy:
+            sla_hours: 48
+            duration_min: 60
+            priority: high
+            attendees_role: ["account_owner", "delivery_lead"]
+        - agent: crm_agent
+          action: log_interaction
+          policy:
+            activity_type: opp_closed_won_vip
+
+  # ─── Standard Win → ERP SO + 감사 메일 + 활동 로그 (3 에이전트) ───
+  opp_won_standard:
+    priority: 300
+    description: "Standard Opp Closed Won — ERP SO + 감사 메일 + 활동 로그"
+    if: "entity == 'sales_opportunity_close' AND opportunity != null AND opportunity.stage == 'Closed Won'"
+    then:
+      priority: normal
+      memory_tier: warm
+      delegate_to:
+        - agent: erp_agent
+          action: create_sales_order
+          policy:
+            target_state: sale
+            customer_lookup: by_name
+            tier: Standard
+            confirm_immediately: true
+            default_product_type: service
+            product_type_override_from_payload: true
+        - agent: email_agent
+          action: send_thank_you
+          policy:
+            tone: professional
+            language: ko
+            template: standard_thank_you
+            sla_hours: 24
+        - agent: crm_agent
+          action: log_interaction
+          policy:
+            activity_type: opp_closed_won_standard
+
+  # ─── Lost (모든 tier) → Analytics 분석 + Re-engage Task + 활동 로그 ───
+  opp_lost:
+    priority: 280
+    description: "Opp Closed Lost — Analytics 사유 분석 + 180일 후 Re-engage Task + 활동 로그 (ERP push 안 함)"
+    if: "entity == 'sales_opportunity_close' AND opportunity != null AND opportunity.stage == 'Closed Lost'"
+    then:
+      priority: normal
+      memory_tier: warm
+      delegate_to:
+        - agent: analytics_agent
+          action: analyze_lost_reason
+          policy:
+            source: opportunity_close
+            include_history: true
+            categorize_reason: true
+        - agent: crm_agent
+          action: create_reengage_task
+          policy:
+            due_date_days: 180
+            subject_template: "Re-engage 검토 — {{ account_name }}"
+            priority: normal
+        - agent: crm_agent
+          action: log_interaction
+          policy:
+            activity_type: opp_closed_lost
+
+  # ═══════════════════════════════════════════════════════════════
+  # BC1 — Email Inbound (기존 룰 — entity == 'email' 로 명시 분리)
+  # ═══════════════════════════════════════════════════════════════
+  # ─── VIP 고객: 최우선 처리 ───
+  existing_vip:
+    priority: 100
+    description: "등록 고객 중 VIP 등급 — 최상급 대응 (Lead 생성 → 우선 미팅 예약 → 초대 메일 → 로그)"
+    if: "entity == 'email' AND customer != null AND customer.tier == 'VIP'"
+    then:
+      priority: high
+      memory_tier: hot
+      # ─── Policy-driven dispatch (v1.2+) ───
+      delegate_to:
+        - agent: crm_agent
+          action: create_qualified_lead
+          policy:
+            status: "Open - Not Contacted"
+            enrichment: required
+            priority: high
+            source: "Email Inquiry (VIP)"
+        - agent: calendar_agent
+          action: book_priority_meeting
+          policy:
+            sla_hours: 24
+            duration_min: 30
+            priority: high
+        - agent: email_agent
+          action: send_meeting_invite
+          policy:
+            tone: professional
+            language: ko
+        - agent: crm_agent
+          action: log_interaction
+          policy:
+            activity_type: vip_meeting_request
+      # (Deprecated) events: 구식 단일 tool 매핑. 신규 코드는 delegate_to 를 사용.
+      events:
+        - create_lead_vip
+        - suggest_meeting_fast
+        - send_reply_vip
+
+  # ─── Standard 고객: 일반 처리 ───
+  existing_standard:
+    priority: 50
+    description: "등록 고객 중 VIP 외 — 일반 대응 (Lead 갱신 → CS 답변 초안 → 메일 발송 → 로그)"
+    if: "entity == 'email' AND customer != null"  # VIP 는 위에서 이미 매칭됨
+    then:
+      priority: normal
+      memory_tier: hot
+      delegate_to:
+        - agent: crm_agent
+          action: create_qualified_lead
+          policy:
+            status: "Open - Not Contacted"
+            priority: normal
+            source: "Email Inquiry (Standard)"
+        - agent: cs_agent
+          action: compose_reply
+          policy:
+            tone: professional
+            language: ko
+            max_length: 800
+            include_sources: true
+        - agent: email_agent
+          action: send_reply
+          policy:
+            tone: professional
+            language: ko
+            sla_hours: 8
+        - agent: crm_agent
+          action: log_interaction
+          policy:
+            activity_type: standard_inquiry
+      events:
+        - create_lead
+        - send_reply_standard
+
+  # ─── 신규 고객: 자격 검증부터 ───
+  new_prospect:
+    priority: 10
+    description: "등록 되지 않은 발신자 — Lead 생성(enrichment 대기) → 환영 메일 → 로그"
+    if: "entity == 'email' AND customer == null"
+    then:
+      priority: unknown
+      memory_tier: warm
+      delegate_to:
+        - agent: crm_agent
+          action: create_qualified_lead
+          policy:
+            status: "Open - Not Contacted"
+            enrichment: required
+            priority: unknown
+            source: "Email Inquiry (NewProspect)"
+        - agent: email_agent
+          action: send_welcome
+          policy:
+            template_id: newprospect_default
+            language: ko
+            sla_hours: 24
+        - agent: crm_agent
+          action: log_interaction
+          policy:
+            activity_type: new_prospect_inquiry
+      events:
+        - create_lead_raw
+        - send_qualification_email
+        - enrich_company_task
+
+
+# ═══════════════════════════════════════════════════════════════
+# 5. Events — (Deprecated, v1.2+) Agent/Tool 호출 선언
+# ═══════════════════════════════════════════════════════════════
+# ⚠️ DEPRECATED: 신규 정책은 rules.then.delegate_to 를 사용하세요.
+# - 이 섹션은 v1.1 이전 룰과의 backward-compat 를 위해 유지됩니다.
+# - engine 은 delegate_to 가 있으면 우선 사용하고, 없을 때만 events 로 폴백합니다.
+events:
+  _meta:
+    execution: sequential        # Phase 1 = 순차. Phase 2 = async+retry.
+    timeout_sec: 30
+
+  # ─── VIP 경로 ───
+  create_lead_vip:
+    agent: crm_agent
+    tool: create_salesforce_lead
+    params:
+      priority: high
+      source: "Email Inquiry (VIP)"
+    retry: { max_attempts: 2 }
+
+  suggest_meeting_fast:
+    agent: calendar_agent
+    tool: propose_slot
+    params:
+      window_days: 2
+
+  send_reply_vip:
+    agent: cs_agent
+    tool: generate_email_reply
+    params:
+      template: vip
+      tone: urgent_premium
+
+  # ─── Standard 경로 ───
+  create_lead:
+    agent: crm_agent
+    tool: create_salesforce_lead
+    params:
+      priority: normal
+
+  send_reply_standard:
+    agent: cs_agent
+    tool: generate_email_reply
+    params:
+      template: standard
+      tone: professional
+
+  # ─── New Prospect 경로 ───
+  create_lead_raw:
+    agent: crm_agent
+    tool: create_salesforce_lead
+    params:
+      priority: unknown
+      status: "Open - Not Contacted"
+
+  send_qualification_email:
+    agent: cs_agent
+    tool: generate_email_reply
+    params:
+      template: qualification
+      tone: inquisitive
+
+  enrich_company_task:
+    agent: cs_agent
+    tool: research_company
+    params:
+      async: true
+
+
+
+# ═══════════════════════════════════════════════════════════════
+# 6. Memory — 3-Tier 메모리 정책
+# ═══════════════════════════════════════════════════════════════
+memory:
+  hot:
+    backend: in_memory
+    ttl_sec: 86400
+    max_size: 1000
+    eviction: LRU
+  warm:
+    backend: sqlite
+    ttl_sec: 2592000
+    path: "./data/memory/warm.db"
+    max_size: 100000
+  cold:
+    backend: jsonl
+    ttl_sec: null
+    path: "./data/memory/cold/"
+    rotation: monthly

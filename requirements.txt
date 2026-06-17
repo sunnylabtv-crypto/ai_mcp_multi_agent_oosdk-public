@@ -1,0 +1,32 @@
+# Multi-Agent FastMCP Server Dependencies
+# Core MCP
+fastmcp>=0.2.0
+
+# Web Framework
+fastapi>=0.104.0
+uvicorn>=0.24.0
+
+# Google APIs (Gmail + Calendar)
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.0
+google-api-python-client>=2.100.0
+
+# OpenAI (Agent LLM + Embeddings)
+openai>=1.0.0
+
+# Salesforce
+simple-salesforce>=1.12.0
+PyJWT>=2.8.0
+cryptography>=41.0.0
+
+# Vector Database (RAG)
+chromadb>=0.4.0
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+pyyaml>=6.0                  # OOSDK ontology.yaml 파싱
+
+# Dashboard (optional)
+streamlit>=1.28.0
