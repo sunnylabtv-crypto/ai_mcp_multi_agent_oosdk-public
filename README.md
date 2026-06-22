@@ -24,9 +24,19 @@ Ontology Engine ── deterministic policy decisions ──►  Agents ("HOW", 
 
 ## Business Case (BC) series — order-to-cash, end-to-end
 A B2B sales-to-cash cycle automated across stages, integrating **Salesforce (SFDC)** and **Odoo ERP**. Design thesis: *the LLM speaks only in the few seats where the answer depends on context; the rest is deterministic policy.*
-- **BC1 Customer pipeline** — lead → customer, with **tier-based branching** of how each lead is handled
-- **BC2 Sales** — **tier-based pricing policy** and quoting; the path forks on whether the deal closes (quote → order)
-- **BC3 Order & inventory** — **tier-based order intake**, **inventory allocation** (deterministic VIP-preempt) + an agent **qty advisor** for shortfalls no rule can fill, driving **replenishment / incoming-stock requests**
+- **BC1 Customer pipeline** — inbound email → sender lookup → **tier routing**, zero LLM (first-match ontology rules), idempotent lead creation:
+  - **VIP** → qualified lead + priority meeting booked within 24h + premium-tone invite
+  - **Standard** → qualified lead + RAG-drafted reply on an 8h SLA
+  - **New prospect** (unregistered) → lead (enrichment pending) + 24h welcome
+- **BC2 Sales** — opportunity with **tier-differentiated pricing & process**, then ERP handoff on close:
+  - **VIP** → 5-stage process, *negotiable* pricing (discount up to a cap, approval beyond)
+  - **Standard** → 4-stage process, *list price* fixed (no discount authority)
+  - **Closed Won** → Odoo **Sales Order** auto-created & confirmed (idempotent) + thank-you (+ VIP kickoff meeting); **Closed Lost** → LLM lost-reason analysis + 180-day re-engage task (no ERP push)
+  - *contract = Opportunity → Sales Order*; pricing is deterministic, the only LLM call is Lost-reason analysis
+- **BC3 Order & inventory** — confirmed SO → line split → deterministic allocation, with AI only where stock truly runs out:
+  - **Line split** — storable → delivery, service → license activation
+  - **Allocation (deterministic)** — VIP soft-preempt / Standard FIFO / partial-fill (Waiting) / re-allocate on stock receipt / batch pre-allocation, over a 4-state model (on-hand / reserved / available / incoming)
+  - **Autonomous replenishment (AI)** — when no rule can fill the shortage: an LLM **qty advisor** sizes the purchase, creates the incoming picking, and writes an LLM **manager briefing** — both AI points fall back to rules
 - **BC4 Ship · Invoice · Collect** — closing the cycle in cash:
   - **Ship** — partial-shipment **advisor** (split / wait) → human approve → one approval chains ship + invoice + notify
   - **Invoice** — deterministic **mixed billing** (per-line invoice policy: shipped qty vs. full); *no rule, no agent — by design*
