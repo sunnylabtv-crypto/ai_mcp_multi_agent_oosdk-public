@@ -23,6 +23,7 @@ from .report_agent import ReportAgent
 from .erp_agent import ERPAgent
 from .analytics_agent import AnalyticsAgent
 from .inventory_agent import InventoryAgent
+from .collections_agent import CollectionsAgent
 
 __all__ = [
     'BaseAgent',
@@ -36,4 +37,5 @@ __all__ = [
     'ERPAgent',
     'AnalyticsAgent',
     'InventoryAgent',
+    'CollectionsAgent',
 ]

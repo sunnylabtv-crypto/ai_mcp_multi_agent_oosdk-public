@@ -494,6 +494,24 @@ rules:
           policy:
             activity_type: inventory_replenish_on_shortage
 
+  # ─── BC5 수금: 연체 → dunning advisor(우선순위·톤) 추천, 사람 승인 후 발송 ───
+  collections_dunning:
+    priority: 380
+    description: "연체 인보이스 → collections_agent 가 회수 우선순위·tier별 톤 판단(LLM), 사람 승인 후 발송"
+    # 얇은 게이트(전략): "연체가 있는가"의 도메인 판정은 collections_agent 가 소유
+    # (run_dunning 이 list_overdue 로 직접 감지, 없으면 no-op). BC3 replenish 와 동일 패턴.
+    if: "entity == 'collections_overdue'"
+    then:
+      priority: high
+      memory_tier: warm
+      delegate_to:
+        - agent: collections_agent
+          action: run_dunning
+          policy:
+            # ── 판단 — 회수 우선순위 + tier별 톤은 collections_agent._dunning_advisor(LLM).
+            #    실패 시 rule 폴백(연체일×금액 + 템플릿). 발송은 사람 승인 후 send_dunning.
+            notify_role: ar_manager
+
   # ─── Standard DO → FIFO 할당 (남는 가용재고만) ───
   inventory_allocate_standard:
     priority: 390

@@ -821,6 +821,188 @@ def register_stock_receipt(
                 "added_qty": qty, "quant_id": quant_id, "method": "created"}
 
 
+# ════════════════════════════════════════════════════════════════
+# BC4 — Invoicing (출고분 기준 account.move 발행)
+# ════════════════════════════════════════════════════════════════
+# 청구 정책(invoice_policy)이 라인별로 갈린다:
+#   · service(라이선스/컨설팅) = 'order'    → 주문 수량 전량 즉시 청구
+#   · consu(USB 재고)          = 'delivery' → 인도(done)된 수량만 청구
+# _create_invoices 는 "현재 청구 가능한(qty_to_invoice>0)" 모든 라인을 1장의
+# account.move 초안으로 만든다 → 부분출고면 USB 출고분만 자동 반영.
+def create_invoice_for_sale_order(
+    sale_order_id: int, post: bool = True, dry_run: bool = False,
+) -> Dict[str, Any]:
+    """
+    SO 의 현재 청구 가능분으로 고객 청구서(account.move) 생성 + (옵션) 확정(post).
+
+    멱등/안전:
+      · invoice_status != 'to invoice' 면 생성 안 함 (이미 청구됨/청구할 것 없음).
+      · 생성 전후 sale_order.invoice_ids 차집합으로 '새로 생긴' 청구서만 식별.
+      · dry_run=True 면 라인별 qty_to_invoice 만 집계해 미리보기 (쓰기 없음).
+    """
+    so = call("sale.order", "read", [sale_order_id],
+              fields=["name", "invoice_status", "invoice_ids"])
+    if not so:
+        return {"ok": False, "error": f"sale.order {sale_order_id} 없음"}
+    so = so[0]
+    status = so.get("invoice_status")
+
+    # 미리보기: 라인별 청구 예정 수량
+    lines = call("sale.order.line", "search_read",
+                 [("order_id", "=", sale_order_id), ("qty_to_invoice", "!=", 0)],
+                 fields=["product_id", "qty_to_invoice", "qty_delivered", "price_unit"])
+    preview = [{"product": (l["product_id"][1] if isinstance(l.get("product_id"), list) else None),
+                "qty_to_invoice": l.get("qty_to_invoice"),
+                "qty_delivered": l.get("qty_delivered")} for l in lines]
+
+    if status != "to invoice":
+        return {"ok": True, "created": False, "reason": f"invoice_status={status!r} (청구할 것 없음)",
+                "preview": preview}
+    if dry_run:
+        return {"ok": True, "created": False, "dry_run": True, "preview": preview}
+
+    before = set(so.get("invoice_ids") or [])
+    # _create_invoices 는 private(원격 호출 차단) → 표준 마법사 사용.
+    # advance_payment_method='delivered' = 인도/청구가능분으로 일반 청구서 생성.
+    # 주의: create_invoices 는 ir.actions.act_window(None 포함) 를 반환 → trial 의
+    #   XMLRPC 마shaller(allow_none=False)가 *응답 직렬화*에서 실패한다. 그러나
+    #   청구서는 이미 커밋된다 → 예외를 흡수하고 invoice_ids 차집합으로 판정.
+    wiz_ctx = {"active_model": "sale.order",
+               "active_ids": [sale_order_id], "active_id": sale_order_id}
+    try:
+        wiz_id = call("sale.advance.payment.inv", "create",
+                      {"advance_payment_method": "delivered"}, context=wiz_ctx)
+        if isinstance(wiz_id, list):
+            wiz_id = wiz_id[0]
+        call("sale.advance.payment.inv", "create_invoices", [wiz_id], context=wiz_ctx)
+    except Exception as e:
+        logger.info(f"[create_invoice_for_sale_order] create_invoices 반환 직렬화 경고"
+                    f"(무해 — 청구서는 생성됨): {type(e).__name__}")
+
+    after_so = call("sale.order", "read", [sale_order_id], fields=["invoice_ids"])[0]
+    new_ids = [i for i in (after_so.get("invoice_ids") or []) if i not in before]
+    if not new_ids:
+        return {"ok": False, "error": "청구서가 생성되지 않음 (new invoice 없음)", "preview": preview}
+
+    if post:
+        try:
+            call("account.move", "action_post", new_ids)
+        except Exception as e:
+            logger.warning(f"[create_invoice_for_sale_order] action_post 실패(초안 유지): {e}")
+
+    invs = call("account.move", "read", new_ids,
+                fields=["name", "state", "amount_total", "invoice_origin"])
+    return {"ok": True, "created": True, "invoice_ids": new_ids,
+            "invoices": invs, "preview": preview}
+
+
+# ════════════════════════════════════════════════════════════════
+# BC5 — 수금 (연체 감지 + 입금 등록 = 실제 ERP 조작)
+# ════════════════════════════════════════════════════════════════
+def list_overdue_invoices(as_of_iso: Optional[str] = None) -> List[Dict[str, Any]]:
+    """미수(미납/부분) + 만기 경과 고객 청구서 조회 (연체 감지, 결정론).
+
+    as_of_iso 미지정 시 today 기준. account_followup 모듈 없이 account.move 로 감지.
+    """
+    import datetime as _dt
+    asof = as_of_iso or _dt.date.today().isoformat()
+    domain = [
+        ("move_type", "=", "out_invoice"),
+        ("state", "=", "posted"),
+        ("payment_state", "in", ["not_paid", "partial"]),
+        ("invoice_date_due", "<", asof),
+    ]
+    ids = call("account.move", "search", domain)
+    if not ids:
+        return []
+    rows = call("account.move", "read", ids,
+                fields=["name", "partner_id", "invoice_date_due",
+                        "amount_total", "amount_residual", "payment_state"])
+    # tier + 고객명 부착 (dunning advisor 입력용) — partner category 기준
+    pids = list({r["partner_id"][0] for r in rows if isinstance(r.get("partner_id"), list)})
+    tier_by_partner: Dict[int, str] = {}
+    if pids:
+        try:
+            partners = call("res.partner", "read", pids, fields=["category_id"])
+            cat_ids = set()
+            for p in partners:
+                cat_ids.update(p.get("category_id") or [])
+            cat_names = {}
+            if cat_ids:
+                for c in call("res.partner.category", "read", list(cat_ids), fields=["name"]):
+                    cat_names[c["id"]] = c.get("name") or ""
+            for p in partners:
+                names = [cat_names.get(cid, "") for cid in (p.get("category_id") or [])]
+                tier_by_partner[p["id"]] = next(
+                    (t for t in ("VIP", "Standard", "Bronze")
+                     if any(t in n for n in names)), "Standard")
+        except Exception as e:
+            logger.warning(f"[list_overdue_invoices] tier 조회 실패: {e}")
+    for r in rows:
+        pf = r.get("partner_id")
+        pid = pf[0] if isinstance(pf, list) else pf
+        r["customer"] = pf[1] if isinstance(pf, list) else ""
+        r["tier"] = tier_by_partner.get(pid, "Standard")
+        try:
+            due = _dt.date.fromisoformat(str(r.get("invoice_date_due")))
+            r["days_overdue"] = (_dt.date.fromisoformat(asof) - due).days
+        except Exception:
+            r["days_overdue"] = None
+    return rows
+
+
+def register_invoice_payment(
+    invoice_id: int, journal_id: Optional[int] = None, amount: Optional[float] = None,
+) -> Dict[str, Any]:
+    """입금 등록 (account.payment.register 마법사) → 인보이스 payment_state=paid.
+
+    이것이 '수금' 의 실제 ERP 조작. amount 미지정 시 미수 전액. journal 미지정 시
+    Bank/Cash 저널 자동. (create_invoices 처럼 마법사 반환 action 의 None 직렬화는
+    무해 — 결과는 payment_state 재조회로 판정.)
+    """
+    if not journal_id:
+        js = call("account.journal", "search",
+                  [("type", "in", ["bank", "cash"])], limit=1)
+        journal_id = js[0] if js else None
+
+    before = call("account.move", "read", [invoice_id],
+                  fields=["name", "payment_state", "amount_residual"])
+    if not before:
+        return {"ok": False, "error": f"invoice {invoice_id} 없음"}
+    before = before[0]
+
+    ctx = {"active_model": "account.move",
+           "active_ids": [invoice_id], "active_id": invoice_id}
+    vals: Dict[str, Any] = {}
+    if journal_id:
+        vals["journal_id"] = journal_id
+    if amount is not None:
+        vals["amount"] = amount
+    try:
+        wiz = call("account.payment.register", "create", vals, context=ctx)
+        if isinstance(wiz, list):
+            wiz = wiz[0]
+        call("account.payment.register", "action_create_payments", [wiz], context=ctx)
+    except Exception as e:
+        logger.info(f"[register_invoice_payment] action 반환 직렬화 경고"
+                    f"(무해 — 입금은 등록됨): {type(e).__name__}")
+
+    after = call("account.move", "read", [invoice_id],
+                 fields=["name", "payment_state", "amount_residual"])[0]
+    return {"ok": after.get("payment_state") in ("paid", "in_payment"),
+            "before": before, "after": after, "journal_id": journal_id}
+
+
+def log_dunning_on_invoice(invoice_id: int, message: str) -> Dict[str, Any]:
+    """독촉 발송 사실을 인보이스 chatter(mail.message)에 기록 → ERP 감사선."""
+    try:
+        call("account.move", "message_post", [invoice_id],
+             body=message, subject="수금 독촉 발송")
+        return {"ok": True, "invoice_id": invoice_id}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 def list_pickings_by_state(states: List[str]) -> List[Dict[str, Any]]:
     """
     지정된 state 들의 모든 outgoing stock.picking 조회.

@@ -47,6 +47,7 @@ from mcp_server.agents.erp_agent import ERPAgent
 from mcp_server.agents.analytics_agent import AnalyticsAgent
 # BC3 신규: Inventory Agent (SO Confirmed → Allocation → Shipping)
 from mcp_server.agents.inventory_agent import InventoryAgent
+from mcp_server.agents.collections_agent import CollectionsAgent
 
 # 로깅 설정
 log_handlers = [logging.StreamHandler()]
@@ -156,6 +157,10 @@ def get_or_create_orchestrator(user_id: str = 'admin') -> Orchestrator:
         inventory_agent = InventoryAgent(llm_config=AGENT_LLM_CONFIG)
         inventory_agent.register_tools_from_services(user_id=user_id)
 
+        # ─── BC5 신규: Collections Agent (수금/AR — dunning advisor) ───
+        collections_agent = CollectionsAgent(llm_config=AGENT_LLM_CONFIG)
+        collections_agent.register_tools_from_services(user_id=user_id)
+
         # Orchestrator에 Agent 등록
         _orchestrator.register_agent('email_agent', email_agent)
         _orchestrator.register_agent('crm_agent', crm_agent)
@@ -168,6 +173,8 @@ def get_or_create_orchestrator(user_id: str = 'admin') -> Orchestrator:
         _orchestrator.register_agent('analytics_agent', analytics_agent)
         # BC3 신규
         _orchestrator.register_agent('inventory_agent', inventory_agent)
+        # BC5 신규
+        _orchestrator.register_agent('collections_agent', collections_agent)
 
         _user_agents_cache[user_id] = {
             'email_agent': email_agent,
@@ -179,6 +186,7 @@ def get_or_create_orchestrator(user_id: str = 'admin') -> Orchestrator:
             'erp_agent': erp_agent,
             'analytics_agent': analytics_agent,
             'inventory_agent': inventory_agent,
+            'collections_agent': collections_agent,
         }
 
         logger.info(f"✅ Agent 시스템 초기화 완료 (user: {user_id})")
@@ -2261,6 +2269,277 @@ async def confirm_partial_shipment(
         "execution_result": exec_res,
         "duration_ms": round((_time.time() - start) * 1000, 2),
     }
+
+
+@mcp.tool()
+async def trigger_shipment_invoice(
+    sale_order_id: int = 0, picking_id: int = 0,
+    post: bool = True, dry_run: bool = False,
+) -> dict:
+    """
+    BC4 — 출고분 기준 고객 청구서(account.move) 발행.
+
+    출고(부분/전량) 후 호출. 청구 정책이 라인별로 갈린다:
+      · invoice_policy='delivery'(USB 재고) → 인도(done)된 수량만 청구
+      · invoice_policy='order'(서비스/라이선스) → 주문 수량 전량 청구
+    → 부분출고면 USB 출고분 + 서비스 전량이 1장의 청구서로 발행 + post.
+
+    Args:
+      sale_order_id: 대상 SO id (직접 지정).
+      picking_id: SO 대신 출고 picking 으로 SO 해석.
+      post: True 면 초안 생성 후 즉시 확정(post). False 면 draft 유지.
+      dry_run: True 면 라인별 청구 예정 수량만 미리보기(쓰기 없음).
+    """
+    import time as _time
+    from mcp_server.services import odoo_service
+    start = _time.time()
+
+    so_id = sale_order_id
+    if not so_id and picking_id:
+        try:
+            p = await asyncio.to_thread(odoo_service.get_picking, picking_id)
+            sale_field = (p or {}).get("sale_id")
+            so_id = sale_field[0] if isinstance(sale_field, list) and sale_field else sale_field
+        except Exception as e:
+            return {"ok": False, "error": f"picking {picking_id} → SO 해석 실패: {e}"}
+    if not so_id:
+        return {"ok": False, "error": "sale_order_id 또는 picking_id 필요"}
+
+    try:
+        res = await asyncio.to_thread(
+            odoo_service.create_invoice_for_sale_order, int(so_id), post, dry_run)
+    except Exception as e:
+        logger.error(f"trigger_shipment_invoice 실패: {e}", exc_info=True)
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:300]}",
+                "duration_ms": round((_time.time() - start) * 1000, 2)}
+
+    if res.get("created"):
+        invs = res.get("invoices") or []
+        names = ", ".join((i.get("name") or f"id{i.get('id')}") for i in invs)
+        res["narrative"] = f"🧾 SO {so_id} 청구서 발행: {names} (출고분 기준)."
+    elif res.get("dry_run"):
+        res["narrative"] = f"(미리보기) SO {so_id} 청구 예정 라인 {len(res.get('preview') or [])}건."
+    else:
+        res["narrative"] = f"SO {so_id} — {res.get('reason') or res.get('error')}"
+    res["duration_ms"] = round((_time.time() - start) * 1000, 2)
+    return res
+
+
+@mcp.tool()
+async def get_orders_allocation_status(product_id: int = 2) -> dict:
+    """현재 고객 주문들의 재고 할당/출고 상태 조회 (read-only).
+
+    각 열린 출고(picking)의 상태 + 제품 수요/예약/부족분 + 고객 tier + 제품 재고 요약.
+    "지금 주문 어떻게 할당돼 있어?" / "출고할 거 뭐 있어?" 같은 질의에 사용.
+
+    Args:
+        product_id: 재고 기준 제품 (기본 2 = USB SecureKey-100).
+    """
+    import time as _time
+    from mcp_server.services import odoo_service
+    start = _time.time()
+    try:
+        picks = await asyncio.to_thread(
+            odoo_service.list_pickings_by_state,
+            ["waiting", "confirmed", "partially_available", "assigned"])
+    except Exception as e:
+        return {"ok": False, "error": f"picking 조회 실패: {type(e).__name__}: {e}"}
+
+    def _sid(p):
+        sf = p.get("sale_id")
+        return sf[0] if isinstance(sf, list) and sf else sf
+
+    sale_ids = [s for s in (_sid(p) for p in picks) if s]
+    tier_map = {}
+    if sale_ids:
+        try:
+            tier_map = await asyncio.to_thread(
+                odoo_service.get_sale_order_tier_map, sale_ids) or {}
+        except Exception:
+            tier_map = {}
+
+    rows = []
+    for p in picks:
+        partner = p.get("partner_id")
+        pname = partner[1] if isinstance(partner, list) and partner else ""
+        try:
+            sh = await asyncio.to_thread(odoo_service.get_picking_shortage, p["id"])
+        except Exception:
+            sh = {}
+        demand, reserved = sh.get("demand"), sh.get("reserved")
+        short = sh.get("shortage")
+        if (reserved or 0) <= 0:
+            status = "미할당(재고 대기)"
+        elif (short or 0) > 0:
+            status = f"부분(부족 {short})"
+        else:
+            status = "전량 할당"
+        rows.append({
+            "picking_id": p["id"], "picking": p.get("name"), "state": p.get("state"),
+            "order": p.get("origin"), "customer": pname,
+            "tier": tier_map.get(_sid(p), "Standard"),
+            "demand": demand, "reserved": reserved, "shortage": short,
+            "alloc_status": status,
+        })
+    rows.sort(key=lambda r: r.get("order") or "")
+
+    try:
+        inv = await asyncio.to_thread(odoo_service.get_inventory_state, product_id)
+    except Exception:
+        inv = {}
+
+    narrative = "열린 출고 없음."
+    if rows:
+        lines = [f"{r['order']} {r['customer']}({r['tier']}) {r['picking']}"
+                 f": 수요 {r['demand']}/예약 {r['reserved']} → {r['alloc_status']}"
+                 for r in rows]
+        narrative = (f"USB 재고 available={inv.get('available')} "
+                     f"(on_hand={inv.get('on_hand')}, reserved={inv.get('reserved')}). "
+                     + " | ".join(lines))
+
+    return {"ok": True, "inventory": inv, "orders": rows,
+            "narrative": narrative,
+            "duration_ms": round((_time.time() - start) * 1000, 2)}
+
+
+# ════════════════════════════════════════════════════════════════
+# BC5 — Collections (수금) — ontology rule → collections_agent → ERP
+#   판단(dunning advisor)은 collections_agent 가 소유. server.py 는 트리거(센서)만.
+# ════════════════════════════════════════════════════════════════
+def _agents_for(user_id: str = None) -> dict:
+    """현재 사용자의 등록 에이전트 dict 반환 (없으면 초기화)."""
+    uid = user_id or get_current_user() or 'admin'
+    if uid not in _user_agents_cache:
+        try:
+            get_or_create_orchestrator(uid)
+        except Exception as e:
+            logger.warning(f"[_agents_for] agent 초기화 실패: {e}")
+    return _user_agents_cache.get(uid) or _user_agents_cache.get('admin') or {}
+
+
+@mcp.tool()
+async def trigger_collections_run(notify_to: str = "", dry_run: bool = False) -> dict:
+    """BC5 수금 1단계 — 연체 감지 + AI 회수 우선순위/톤 추천 (발송 보류).
+
+    'collections_overdue' entity 를 발화 → ontology rule(collections_dunning) →
+    collections_agent.run_dunning 에 위임. (감지·dunning advisor 는 에이전트가 소유.)
+    실제 발송은 confirm_dunning 승인 후. "연체 누구부터 독촉할지 알려줘" 질의에 사용.
+    """
+    import time as _time
+    start = _time.time()
+    try:
+        engine = get_or_create_ontology_engine()
+    except Exception as e:
+        return {"ok": False, "error": f"engine init: {e}"}
+
+    payload = {"id": f"collections_{int(start)}", "notify_to": notify_to}
+    try:
+        ctx = engine.resolve_links("collections_overdue", payload)
+        action = engine.check_rules(ctx)
+        plan = engine.trigger_events(action, ctx) if action else []
+        rule_name = (action or {}).get("rule_name") or "none"
+    except Exception as e:
+        return {"ok": False, "error": f"ontology: {type(e).__name__}: {e}"}
+    if not plan:
+        return {"ok": False, "error": f"collections rule 매칭 실패 (rule={rule_name})"}
+
+    agents = _agents_for()
+    recs, source, dispatched = [], None, []
+    for idx, step in enumerate(plan):
+        agent_id, action_name = step.get("agent"), step.get("action")
+        agent_obj = agents.get(agent_id)
+        if not agent_obj:
+            dispatched.append({"step": idx, "agent": agent_id, "error": "미등록"})
+            continue
+        try:
+            result = await agent_obj.execute_action(
+                action_name, policy=step.get("policy") or {}, context=ctx)
+            inner = result.get("result") or {}
+            dispatched.append({"step": idx, "agent": agent_id, "action": action_name,
+                               "success": result.get("success")})
+            if agent_id == "collections_agent" and action_name == "run_dunning":
+                recs = inner.get("collections") or []
+                source = inner.get("source")
+        except Exception as e:
+            logger.error(f"[trigger_collections_run] step {idx} 실패: {e}", exc_info=True)
+            dispatched.append({"step": idx, "agent": agent_id, "error": str(e)[:200]})
+
+    if not recs:
+        return {"ok": True, "count": 0, "collections": [], "narrative": "연체 청구서 없음.",
+                "ontology_trace": {"matched_rule": rule_name}}
+    if not dry_run:
+        engine.manage_memory("collections_pending",
+                             {"ts": _time.time(), "recs": recs, "notify_to": notify_to},
+                             tier="warm", ttl_sec=86400)
+    lines = [f"{r.get('priority')}. {r.get('customer')}({r.get('tier')}) {r.get('name')} "
+             f"미수 {r.get('amount_residual')} / {r.get('days_overdue')}일연체 → 톤:{r.get('tone')}"
+             for r in recs]
+    return {"ok": True, "count": len(recs), "source": source, "collections": recs,
+            "ontology_trace": {"matched_rule": rule_name, "event_plan": plan},
+            "narrative": (f"연체 {len(recs)}건 — AI 회수 우선순위:\n" + "\n".join(lines)
+                          + "\n→ confirm_dunning 으로 독촉 승인."),
+            "duration_ms": round((_time.time() - start) * 1000, 2)}
+
+
+@mcp.tool()
+async def confirm_dunning(notify_to: str = "") -> dict:
+    """BC5 수금 2단계 — 독촉 승인·실행. collections_agent.send_dunning 위임 (발송+chatter)."""
+    import time as _time
+    start = _time.time()
+    try:
+        engine = get_or_create_ontology_engine()
+    except Exception as e:
+        return {"ok": False, "error": f"engine: {e}"}
+    stored = None
+    for t in ("warm", "hot"):
+        try:
+            stored = engine.memory.get("collections_pending", tier=t)
+        except Exception:
+            stored = None
+        if stored:
+            break
+    if not stored:
+        return {"ok": False, "error": "보류된 수금 건 없음 (trigger_collections_run 먼저 호출)"}
+
+    agent = _agents_for().get("collections_agent")
+    if not agent:
+        return {"ok": False, "error": "collections_agent 미등록"}
+    ctx = {"recs": stored.get("recs") or [],
+           "notify_to": notify_to or stored.get("notify_to")}
+    try:
+        res = await agent.execute_action("send_dunning", policy={}, context=ctx)
+        inner = res.get("result") or {}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+    try:
+        engine.memory.delete("collections_pending", tier="warm")
+    except Exception:
+        pass
+    return {"ok": True, "to": inner.get("to"), "sent": inner.get("sent"),
+            "narrative": inner.get("narrative"),
+            "duration_ms": round((_time.time() - start) * 1000, 2)}
+
+
+@mcp.tool()
+async def register_collection_payment(invoice_id: int = 0, invoice_name: str = "") -> dict:
+    """BC5 수금 3단계 — 입금 등록 → 인보이스 회수. collections_agent.register_payment 위임.
+
+    고객 입금 시 호출. invoice_id 또는 invoice_name(예: 'INV/2026/00001') 으로 지정.
+    """
+    import time as _time
+    start = _time.time()
+    agent = _agents_for().get("collections_agent")
+    if not agent:
+        return {"ok": False, "error": "collections_agent 미등록"}
+    ctx = {"invoice_id": invoice_id, "invoice_name": invoice_name}
+    try:
+        res = await agent.execute_action("register_payment", policy={}, context=ctx)
+        inner = res.get("result") or {}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+    return {"ok": inner.get("ok"), "narrative": inner.get("narrative"),
+            "detail": inner.get("detail"), "error": inner.get("error"),
+            "duration_ms": round((_time.time() - start) * 1000, 2)}
 
 
 @mcp.tool()
