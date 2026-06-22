@@ -4,29 +4,41 @@
 
 > The flagship of the **SunnyLab** build series. This is a **sanitized public showcase** — credentials, tokens, and infrastructure identifiers (GCP project, VM IP, Odoo tenant) were removed before publishing. Some modules require your own Odoo/Salesforce/GCP configuration to run end to end.
 
+![Order-to-Cash lifecycle — Lead → Quote → Order/Inventory → Ship · Invoice · Collect, closing on cash. The happy path is deterministic; only two judgments are AI: partial-shipment split and dunning.](assets/order-to-cash-lifecycle.png)
+
+> **Order-to-cash now closes end-to-end** — from Lead all the way to a real `account.payment` ("In Payment") in Odoo. Across the whole cycle the LLM speaks in **exactly two seats** (how to ship a short order, and who to chase first and in what tone); everything else — allocation, dispatch, invoicing, payment — is deterministic policy. That boundary is a single yaml toggle.
+
 ## Core idea
 ```
 ontology.yaml  (policy / strategy, human-editable)
         │   "WHAT to do, under which policy"
         ▼
 Ontology Engine ── deterministic policy decisions ──►  Agents ("HOW", execution)
-        │                                                 ├─ sales / crm / erp / inventory
+        │                                                 ├─ crm / erp / inventory / collections
         │                                                 ├─ cs / helpdesk / email / calendar
-        └─ when needed: LLM reasoning + RAG               └─ analytics / report
+        └─ when needed: LLM reasoning + RAG               └─ analytics / report   (10 domain agents)
 ```
 - **Policy-driven dispatch** — many decisions need *zero* LLM calls (cost + determinism)
-- **Extensible by design** — add a new domain agent on the same base; the ontology wires it in
+- **LLM only where the answer depends on context** — caged as an *advisor*: whitelisted input, forced JSON, human approval, deterministic fallback if the model is off or fails
+- **Extensible by design** — add a new domain agent on the same base; the ontology wires it in (the `collections_agent` was added this way to close the cycle)
 
-## Business Case (BC) series — end-to-end automation
-A sales funnel automated across stages, integrating **Salesforce (SFDC)** and **Odoo ERP**:
-- **BC2 Sales** — lead convert, pricing/quote
-- **BC3 Fulfillment** — order → inventory → shipping, Odoo automation
-- **BC4 Inventory allocation** — deterministic A/B/C priority + override
-- **BC5 Replenishment** — autonomous purchase/replenishment with a manager briefing
+## Business Case (BC) series — order-to-cash, end-to-end
+A B2B sales-to-cash cycle automated across stages, integrating **Salesforce (SFDC)** and **Odoo ERP**. Design thesis: *the LLM speaks only in the few seats where the answer depends on context; the rest is deterministic policy.*
+- **BC1 Customer pipeline** — lead → customer, with **tier-based branching** of how each lead is handled
+- **BC2 Sales** — **tier-based pricing policy** and quoting; the path forks on whether the deal closes (quote → order)
+- **BC3 Order & inventory** — **tier-based order intake**, **inventory allocation** (deterministic VIP-preempt) + an agent **qty advisor** for shortfalls no rule can fill, driving **replenishment / incoming-stock requests**
+- **BC4 Ship · Invoice · Collect** — closing the cycle in cash:
+  - **Ship** — partial-shipment **advisor** (split / wait) → human approve → one approval chains ship + invoice + notify
+  - **Invoice** — deterministic **mixed billing** (per-line invoice policy: shipped qty vs. full); *no rule, no agent — by design*
+  - **Collect** — dunning **advisor** (recovery priority + tier tone: VIP gentle / repeat-late firm) → approve → send + chatter → `account.payment` → invoice **"In Payment"**
+
+> Two AI advisor seats (partial-shipment, dunning); everything between is deterministic, and both execute only after a human approves.
 
 ## Key capabilities
 - **Ontology engine** that encodes business policy and drives multi-agent collaboration
-- **Multi-domain agents** (sales, CRM, ERP, inventory, CS, helpdesk, email, calendar, analytics, report) over **MCP / FastMCP**
+- **10 multi-domain agents** (CRM, ERP, inventory, collections, CS, helpdesk, email, calendar, analytics, report) over **MCP / FastMCP**
+- **Caged LLM advisors** — two-step `trigger → confirm`: the model only *recommends*, a human approves, and execution is deterministic (with a rule fallback if the model fails)
+- **Order-to-cash close** — partial shipping, mixed-billing invoicing, and AR collections → real Odoo `account.payment`
 - **Enterprise integration** — SFDC + Odoo ERP adapters; **RAG (ChromaDB)**; 3-tier memory (hot/warm/cold)
 - **Bilingual Streamlit dashboard** (KR/EN) — decisions, inventory, ontology stats
 - **Cloud-native** — Docker, Cloud Build, GitHub Actions (project/VM values are placeholders)
@@ -40,8 +52,8 @@ ontology/            # ontology.yaml — business policy as code
 mcp_server/          # ontology engine, domain agents, tools, adapters (SFDC/Odoo)
 dashboard_modules/   # dashboard components
 dashboard.py / dashboard_en.py   # Streamlit dashboards (KR/EN)
-scripts/             # BC2-BC5 business-case demos & setup
-docs/                # design notes / specs
+scripts/             # BC1-BC4 business-case demos & setup
+assets/              # order-to-cash lifecycle diagram
 tests/               # unit tests
 .env.example         # required env vars (no real keys)
 ```
